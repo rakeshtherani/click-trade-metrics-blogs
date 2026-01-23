@@ -27,6 +27,9 @@ This document covers advanced ClickHouse patterns and best practices:
 18. Compression codecs
 19. Nullable antipattern
 
+**Operational Patterns (Section 20)**
+20. Trillion-row operations (staged deployment, gap detection, fix-the-past, lightweight deletes)
+
 ---
 
 ## 1. OHLCV Candle Generation
@@ -2129,9 +2132,359 @@ funding_source LowCardinality(Nullable(String))
 
 ---
 
+## 20. Operational Patterns at Scale
+
+### 20.1 Staged Parallel Deployment (Zero-Downtime Migration)
+
+When migrating pipelines at trillion-row scale, use staged parallel deployment to minimize risk.
+
+**Architecture**:
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    STAGED PARALLEL DEPLOYMENT                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    PRODUCTION DATABASE                           │    │
+│  │                         (pypi)                                   │    │
+│  │   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │    │
+│  │   │ main_table  │◄───│   Legacy    │    │    MVs      │         │    │
+│  │   │ (serving)   │    │   Script    │    │ (aggregates)│         │    │
+│  │   └─────────────┘    └─────────────┘    └─────────────┘         │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    STAGING DATABASE                              │    │
+│  │                    (pypi_clickpipes)                             │    │
+│  │   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │    │
+│  │   │  raw_table  │───►│  Transform  │───►│ main_table  │         │    │
+│  │   │ (Null eng)  │    │     MV      │    │  (staging)  │         │    │
+│  │   └─────────────┘    └─────────────┘    └─────────────┘         │    │
+│  │         ▲                                                        │    │
+│  │         │                                                        │    │
+│  │   ┌─────────────┐                                                │    │
+│  │   │ ClickPipes  │  ← New ingestion pipeline                      │    │
+│  │   │ (managed)   │                                                │    │
+│  │   └─────────────┘                                                │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Migration Steps**:
+```sql
+-- Step 1: Create staging database (clone schemas)
+CREATE DATABASE pypi_clickpipes;
+
+CREATE TABLE pypi_clickpipes.raw_ingest (
+    -- Same schema as source
+    ...
+) ENGINE = Null;  -- Null engine = no storage, just passes to MVs
+
+CREATE TABLE pypi_clickpipes.main_staging AS pypi.main_table;
+
+-- Step 2: Create transformation MV in staging
+CREATE MATERIALIZED VIEW pypi_clickpipes.transform_mv TO pypi_clickpipes.main_staging AS
+SELECT
+    -- Normalization, type conversion, field mapping
+    lower(project) AS project,
+    toDate(timestamp) AS date,
+    ...
+FROM pypi_clickpipes.raw_ingest;
+
+-- Step 3: Run BOTH pipelines in parallel (legacy + new)
+-- Step 4: Validate by comparing row counts (see 20.2)
+-- Step 5: Switch MV target to production when validated
+ALTER TABLE pypi_clickpipes.transform_mv MODIFY QUERY
+    ... TO pypi.main_table AS ...;  -- Now writes to production
+
+-- Step 6: Disable legacy pipeline
+```
+
+**Benefits**:
+- Zero downtime during migration
+- Easy rollback (just re-enable legacy)
+- Validation before production impact
+- Transformation logic in SQL (auditable, versionable)
+
+### 20.2 Gap Detection via Row Count Validation
+
+At trillion-row scale, data gaps are easy to miss. Queries still work, dashboards render, but results are quietly incorrect.
+
+**Day-by-Day Validation Query**:
+```sql
+-- Compare ClickHouse counts vs source (e.g., BigQuery export)
+WITH source_counts AS (
+    SELECT
+        date,
+        count() AS source_rows
+    FROM source_reference_table  -- Or import from BigQuery/S3
+    GROUP BY date
+),
+clickhouse_counts AS (
+    SELECT
+        toDate(timestamp) AS date,
+        count() AS ch_rows
+    FROM main_table
+    GROUP BY date
+)
+SELECT
+    coalesce(s.date, c.date) AS date,
+    s.source_rows,
+    c.ch_rows,
+    s.source_rows - c.ch_rows AS missing_rows,
+    round((s.source_rows - c.ch_rows) / s.source_rows * 100, 2) AS missing_pct
+FROM source_counts s
+FULL OUTER JOIN clickhouse_counts c ON s.date = c.date
+WHERE s.source_rows != c.ch_rows
+   OR s.source_rows IS NULL
+   OR c.ch_rows IS NULL
+ORDER BY date;
+```
+
+**Automated Gap Detection**:
+```sql
+-- Find days with suspiciously low counts (potential gaps)
+SELECT
+    toDate(timestamp) AS date,
+    count() AS rows,
+    avg(rows) OVER (ORDER BY date ROWS BETWEEN 7 PRECEDING AND 7 FOLLOWING) AS avg_7d,
+    rows / avg_7d AS ratio_to_avg
+FROM main_table
+WHERE timestamp > today() - 90
+GROUP BY date
+HAVING ratio_to_avg < 0.5  -- Less than 50% of surrounding average
+ORDER BY date;
+```
+
+**Continuous Monitoring View**:
+```sql
+CREATE VIEW v_data_freshness AS
+SELECT
+    'trades' AS table_name,
+    max(timestamp) AS last_record,
+    dateDiff('minute', max(timestamp), now()) AS minutes_stale,
+    count() AS records_last_hour,
+    CASE
+        WHEN dateDiff('minute', max(timestamp), now()) > 5 THEN 'ALERT'
+        WHEN dateDiff('minute', max(timestamp), now()) > 2 THEN 'WARNING'
+        ELSE 'OK'
+    END AS status
+FROM trades
+WHERE timestamp > now() - INTERVAL 1 HOUR;
+```
+
+### 20.3 Fix-the-Past: Historical Data Repair
+
+ClickHouse 25.7+ introduced lightweight deletes, making historical repairs possible at trillion-row scale without full rebuilds.
+
+**Repair Process for Daily-Aggregated Tables**:
+```sql
+-- Scenario: Data gap discovered for 2024-01-15
+
+-- Step 1: Delete affected day from aggregated tables
+DELETE FROM pypi_downloads_per_day
+WHERE date = '2024-01-15';
+
+DELETE FROM pypi_downloads_per_day_by_version
+WHERE date = '2024-01-15';
+
+-- Step 2: Delete affected day from main table
+DELETE FROM main_table
+WHERE toDate(timestamp) = '2024-01-15';
+
+-- Step 3: Re-ingest source data for that day
+INSERT INTO main_table
+SELECT * FROM s3('s3://bucket/backfill/2024-01-15/*.parquet');
+
+-- Step 4: MVs automatically rebuild aggregates for the new data
+-- (No action needed if MVs are properly configured)
+```
+
+**Repair Process for Non-Daily MVs**:
+```sql
+-- For MVs without daily grouping, must drop and recreate to avoid duplicates
+
+-- Step 1: Drop the MV (prevents duplicate inserts during backfill)
+DROP VIEW IF EXISTS mv_monthly_aggregates;
+
+-- Step 2: Delete and re-ingest (same as above)
+DELETE FROM main_table WHERE toDate(timestamp) = '2024-01-15';
+INSERT INTO main_table SELECT * FROM s3('...');
+
+-- Step 3: Recreate MV
+CREATE MATERIALIZED VIEW mv_monthly_aggregates TO monthly_aggregates AS
+SELECT
+    toStartOfMonth(timestamp) AS month,
+    sum(value) AS total
+FROM main_table
+GROUP BY month;
+
+-- Step 4: Backfill the MV target table
+INSERT INTO monthly_aggregates
+SELECT
+    toStartOfMonth(timestamp) AS month,
+    sum(value) AS total
+FROM main_table
+WHERE toStartOfMonth(timestamp) = toStartOfMonth('2024-01-15')
+GROUP BY month;
+```
+
+**Lightweight Delete Performance**:
+```sql
+-- Lightweight DELETE (25.7+) is much faster than mutations
+-- Old way (slow):
+ALTER TABLE main_table DELETE WHERE date = '2024-01-15';
+-- Runs as mutation, rewrites entire parts
+
+-- New way (fast):
+DELETE FROM main_table WHERE date = '2024-01-15';
+-- Marks rows as deleted, cleaned up during merge
+-- Up to 1000x faster on large tables
+```
+
+**Monitoring Delete Progress**:
+```sql
+-- Check lightweight delete status
+SELECT
+    table,
+    command,
+    elapsed,
+    progress,
+    is_done
+FROM system.mutations
+WHERE table = 'main_table'
+  AND NOT is_done
+ORDER BY create_time DESC;
+```
+
+### 20.4 Database Separation Pattern
+
+Separate ingestion from serving for better isolation and operational control.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│   INGESTION DATABASE              SERVING DATABASE          │
+│   (data_ingestion)                (data_production)         │
+│                                                              │
+│   ┌─────────────────┐            ┌─────────────────┐        │
+│   │   raw_trades    │            │     trades      │        │
+│   │  (Null engine)  │            │  (MergeTree)    │◄──┐    │
+│   └────────┬────────┘            └─────────────────┘   │    │
+│            │                                            │    │
+│            ▼                                            │    │
+│   ┌─────────────────┐                                  │    │
+│   │  transform_mv   │──────────────────────────────────┘    │
+│   │  (normalize,    │                                       │
+│   │   enrich,       │            ┌─────────────────┐        │
+│   │   validate)     │───────────►│   ohlcv_1m      │        │
+│   └─────────────────┘            │  (aggregates)   │        │
+│                                  └─────────────────┘        │
+│                                                              │
+│   Benefits:                                                  │
+│   - Pipeline changes don't affect queries                   │
+│   - Can pause ingestion without downtime                    │
+│   - Separate resource limits                                │
+│   - Easier debugging and monitoring                         │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```sql
+-- Ingestion database
+CREATE DATABASE data_ingestion;
+
+CREATE TABLE data_ingestion.raw_trades (...) ENGINE = Null;
+
+CREATE MATERIALIZED VIEW data_ingestion.mv_to_production
+TO data_production.trades AS
+SELECT
+    -- Transform and validate
+    ...
+FROM data_ingestion.raw_trades
+WHERE isValid(price) AND isValid(quantity);  -- Filter bad data
+
+-- Serving database
+CREATE DATABASE data_production;
+
+CREATE TABLE data_production.trades (...) ENGINE = MergeTree() ...;
+
+-- API queries only hit data_production
+-- Ingestion issues don't affect query performance
+```
+
+### 20.5 Trillion-Row Optimization Checklist
+
+Based on ClickPy's experience with 2+ trillion rows:
+
+| Optimization | Target | Technique |
+|--------------|--------|-----------|
+| **Bytes per row** | < 1.5 bytes | Type downsizing, codecs |
+| **Type sizing** | Minimal | Int64 → Int16/UInt8 based on actual range |
+| **Date columns** | 90%+ compression | DoubleDelta + ZSTD(1) |
+| **Sparse columns** | 25%+ reduction | T64 + ZSTD(1) for >60% zeros |
+| **String columns** | Dictionary encoding | LowCardinality for <100K unique |
+| **ZSTD level** | 1-3 max | Higher levels = diminishing returns |
+| **ORDER BY** | Enable compression | Sorted data compresses better |
+| **Query limits** | 10B rows max | Prevent resource exhaustion |
+
+**T64 Codec** (not in previous sections):
+```sql
+-- T64 is excellent for sparse integer columns (>60% zeros)
+-- It stores only the bits actually used
+
+CREATE TABLE metrics (
+    timestamp DateTime64(3) CODEC(DoubleDelta, ZSTD(1)),
+    value Float64 CODEC(Gorilla),
+    error_count UInt32 CODEC(T64, ZSTD(1)),      -- Sparse: mostly 0
+    retry_count UInt16 CODEC(T64, ZSTD(1)),      -- Sparse: mostly 0
+    precipitation Float32 CODEC(T64, ZSTD(1))    -- Sparse: often 0
+) ENGINE = MergeTree()
+ORDER BY timestamp;
+```
+
+**DoubleDelta + ZSTD for Dates** (dramatic compression):
+```sql
+-- Date columns with uniform intervals compress extremely well
+-- Example: 2.24GB → 24MB (99% reduction)
+
+CREATE TABLE events (
+    event_date Date CODEC(DoubleDelta, ZSTD(1)),
+    event_time DateTime64(3) CODEC(DoubleDelta, ZSTD(1)),
+    ...
+) ENGINE = MergeTree()
+ORDER BY (event_date, event_time);
+```
+
+**Type Downsizing Example**:
+```sql
+-- Before: 135GB uncompressed
+CREATE TABLE trades_v1 (
+    trade_id Int64,           -- Actually fits in UInt32
+    price Float64,            -- Only need 8 decimals
+    quantity Float64,         -- Only need 8 decimals
+    side String               -- Only 'buy' or 'sell'
+);
+
+-- After: 36GB uncompressed (73% reduction)
+CREATE TABLE trades_v2 (
+    trade_id UInt32,                              -- Downsized
+    price Decimal64(8),                           -- Fixed precision
+    quantity Decimal64(8),                        -- Fixed precision
+    side Enum8('buy' = 1, 'sell' = 2)            -- Enum instead of String
+);
+```
+
+---
+
 ## Sources
 
 ### Official ClickHouse Documentation & Blogs
+- [ClickHouse: ClickPy at 2 Trillion Rows](https://clickhouse.com/blog/clickpy-2-trillion-rows)
+- [ClickHouse: ClickPy One Trillion Rows](https://clickhouse.com/blog/clickpy-one-trillion-rows)
+- [ClickHouse: Optimizing with Schemas and Codecs](https://clickhouse.com/blog/optimize-clickhouse-codecs-compression-schema)
 - [ClickHouse: Chaining Materialized Views](https://clickhouse.com/blog/chaining-materialized-views)
 - [ClickHouse: Using Materialized Views](https://clickhouse.com/blog/using-materialized-views-in-clickhouse)
 - [ClickHouse: Lazy Materialization](https://clickhouse.com/blog/clickhouse-gets-lazier-and-faster-introducing-lazy-materialization)
